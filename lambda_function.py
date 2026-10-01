@@ -1,5 +1,10 @@
 # ============================================================================
-# lambda_function.py — RIO-ASP-ROUTE-MT
+# lambda_function.py — RIO-RouteRelaciones (antes RIO-ASP-ROUTE-MT)
+# ----------------------------------------------------------------------------
+# Ruteo de relaciones entre dispositivos LoRa (2026-10-01): renombrada desde
+# RIO-ASP-ROUTE-MT porque pasa a ser la encargada de TODAS las relaciones
+# entre nodos RIO que configura GIOMaps (maestro de relaciones). Por ahora
+# solo implementa la relacion aspersor -> motor descrita abajo.
 # ----------------------------------------------------------------------------
 # Puente entre los nodos aspersor (RIO-ASP) y los nodos motor (RIO-DSL).
 # NO reemplaza ni modifica ninguna de las cuatro Lambdas existentes
@@ -105,7 +110,7 @@
 # IOT RULE (sin cambios respecto a la v1):
 #   Nombre sugerido: RIO_Route_Aspersor_To_Motor
 #   SQL: SELECT * FROM 'RIO/ASP/DECODED'
-#   Acción: Lambda -> RIO-ASP-ROUTE-MT
+#   Acción: Lambda -> RIO-RouteRelaciones
 #
 # ============================================================================
 # IAM — el rol de ejecución ahora necesita permisos sobre AMBAS tablas:
