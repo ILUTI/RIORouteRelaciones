@@ -5,6 +5,14 @@
 # RIO-ASP-ROUTE-MT porque pasa a ser la encargada de TODAS las relaciones
 # entre nodos RIO que configura GIOMaps (maestro de relaciones). Por ahora
 # solo implementa la relacion aspersor -> motor descrita abajo.
+#
+# DOS CAMINOS (2026-10-01), segun la forma del evento:
+#   - DynamoDB Stream de GIOEstadoVivo ({"Records": [...]}): relaciones y
+#     parametros desde el espejo de maestros de GIOMaps, lecturas desde el
+#     estado en vivo — ver ruteo_relaciones.py. Es el camino nuevo.
+#   - Registro plano de la IoT Rule sobre RIO/ASP/DECODED (camino anterior,
+#     descrito abajo): RIO-AspersorMotorMap. Se mantiene mientras la regla
+#     siga activa; retirarlo junto con la regla y esa tabla.
 # ----------------------------------------------------------------------------
 # Puente entre los nodos aspersor (RIO-ASP) y los nodos motor (RIO-DSL).
 # NO reemplaza ni modifica ninguna de las cuatro Lambdas existentes
@@ -52,16 +60,16 @@
 #
 #   RIO-ASP-DecodeUplink ya publica cada frame de tracker decodificado en
 #   RIO/ASP/DECODED, con forma { "codigo_maquinaria": "ASP-0001",
-#   "presion_actual": 26, ... }.
+#   "presion": 26, ... }.
 #
 #   ⚠️ Contrato de entrada VERIFICADO (2026-09-09) contra el código real de
 #   RIO-ASP-DecodeUplink, no asumido: build_gio_software_record() en
 #   RIO-ASP-DecodeUplink/decoder.py (líneas ~1946-1989) es exactamente lo
 #   que se publica en RIO/ASP/DECODED para un frame de tracker, y coincide
 #   campo por campo con lo que lee extract_reading() acá abajo
-#   (codigo_maquinaria, presion_actual) y con test_event.json. Mismo
+#   (codigo_maquinaria, presion) y con test_event.json. Mismo
 #   tópico también recibe ACKs/NACKs de configuración de ese aspersor
-#   (otra forma de registro, sin presion_actual, a veces sin
+#   (otra forma de registro, sin presion, a veces sin
 #   codigo_maquinaria) — la IoT Rule (SELECT * FROM 'RIO/ASP/DECODED') no
 #   filtra por tipo de mensaje, así que esos SÍ llegan a esta Lambda, pero
 #   extract_reading() los descarta de forma limpia (ver su docstring) sin
@@ -227,16 +235,16 @@ PARAMETRO_PRESION_REMOTA = "PRESION_REMOTO"
 def extract_reading(event):
     """`event` es el registro plano que ya publica RIO-ASP-DecodeUplink en
     RIO/ASP/DECODED. Solo interesan los frames de tracker (traen
-    codigo_maquinaria + presion_actual) — los ACK/NACK de configuración
+    codigo_maquinaria + presion) — los ACK/NACK de configuración
     (mismo tópico, misma Rule, sin filtro por tipo de mensaje) no traen
-    presion_actual y se ignoran acá sin que sea un error ni tocar
+    presion y se ignoran acá sin que sea un error ni tocar
     DynamoDB/IoT. Verificado contra build_gio_software_record() en
     RIO-ASP-DecodeUplink/decoder.py (2026-09-09) — ver nota en el header
     del archivo. No filtra por `falla_sensor` acá — eso lo hace
     lambda_handler() con un motivo de descarte propio, ver
     is_sensor_fault()."""
     aspersor_id = event.get("codigo_maquinaria")
-    presion = event.get("presion_actual")
+    presion = event.get("presion")
     if aspersor_id is None or presion is None:
         return None
     return aspersor_id, presion
@@ -246,7 +254,7 @@ def is_sensor_fault(event):
     """`falla_sensor` (bool) es un campo nuevo (2026-09-09) que agrega
     RIO-ASP-DecodeUplink cuando el lazo 4-20mA del sensor está en falla
     eléctrica (NAMUR FAULT_LOW/FAULT_HIGH — cable suelto o corto). En
-    ese caso `presion_actual` sigue viniendo (el firmware la calcula
+    ese caso `presion` sigue viniendo (el firmware la calcula
     igual con la fórmula lineal normal), pero es un valor sin sentido:
     puede leerse como 0 psi (indistinguible de aspersor apagado) o como
     una presión alta plausible (falso positivo de sobrepresión). No
@@ -303,16 +311,32 @@ def lambda_handler(event, context):
     # criterio que el resto del repo.
     import boto3
 
+    if isinstance(event, dict) and isinstance(event.get("Records"), list):
+        from ruteo_relaciones import rutear_registro_stream
+        ddb = boto3.client("dynamodb")
+        iot = boto3.client("iot-data")
+        resultados = []
+        for registro in event["Records"]:
+            resultado = rutear_registro_stream(registro, ddb, iot)
+            print(f"[ruteo] {json.dumps(resultado, default=str)}")
+            resultados.append(resultado)
+        return {"registros": len(resultados), "resultados": resultados}
+
+    return manejar_lectura_rule(event, boto3)
+
+
+def manejar_lectura_rule(event, boto3):
+    """Camino anterior: registro plano de la IoT Rule sobre RIO/ASP/DECODED."""
     reading = extract_reading(event)
     if reading is None:
         return {
             "skipped": True,
-            "reason": "evento sin codigo_maquinaria/presion_actual (probablemente un ACK de config, no un frame de tracker)",
+            "reason": "evento sin codigo_maquinaria/presion (probablemente un ACK de config, no un frame de tracker)",
         }
     aspersor_id, presion = reading
 
     # 0. Descartar ANTES de tocar DynamoDB si el sensor reportó falla
-    #    eléctrica — presion_actual no es confiable en ese caso (ver
+    #    eléctrica — presion no es confiable en ese caso (ver
     #    is_sensor_fault()). No se actualiza lastPresion de este
     #    aspersor: se trata igual que si no hubiera reportado nada este
     #    ciclo, para no corromper la agregación con un valor sin sentido.
@@ -323,7 +347,7 @@ def lambda_handler(event, context):
             "reason": (
                 f"descartado: falla_sensor=true "
                 f"(estado_electrico={event.get('estado_electrico')!r}) — "
-                "presion_actual no es confiable, no se actualiza DynamoDB"
+                "presion no es confiable, no se actualiza DynamoDB"
             ),
         }
 
