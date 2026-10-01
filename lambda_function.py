@@ -76,9 +76,15 @@
 #     6. Aplica debounce contra el último valor PUBLICADO a ese motor
 #        (tabla separada RIO-MotorDownlinkState) — solo publica si cambió
 #        lo suficiente o pasó suficiente tiempo.
-#     7. Si corresponde publicar, manda {"PRESION": valor} a
+#     7. Si corresponde publicar, manda {"PRESION_REMOTO": valor} a
 #        RIO/<motorId>/downlink — mismo tópico/formato que ya entiende
 #        RIO-DSL-SendDownlink, sin tocar esa Lambda.
+#        ⚠️ CORREGIDO 2026-10-01: antes mandaba {"PRESION": ...}, pero el ID
+#        17 se renombró a PRESION_REMOTO en la PARAMETER_TABLE de
+#        RIO-DSL-SendDownlink (junto con el firmware) — con el nombre viejo
+#        esa Lambda rechazaba cada publicación ("nombre de parametro
+#        desconocido") y el motor no recibía la presión remota. Ver
+#        PARAMETRO_PRESION_REMOTA.
 #
 # ============================================================================
 # TABLAS DYNAMODB
@@ -208,6 +214,9 @@ DEBOUNCE_DELTA_PSI = float(os.environ.get("DEBOUNCE_DELTA_PSI", "2.0"))
 DEBOUNCE_MIN_INTERVAL_SECONDS = int(os.environ.get("DEBOUNCE_MIN_INTERVAL_SECONDS", "60"))
 
 DOWNLINK_TOPIC_TEMPLATE = "RIO/{motor_id}/downlink"
+# Nombre del parametro tal como lo espera la PARAMETER_TABLE de
+# RIO-DSL-SendDownlink (ID 17, CALIB_ID_PRESION_REMOTO en el firmware DSL).
+PARAMETRO_PRESION_REMOTA = "PRESION_REMOTO"
 
 
 def extract_reading(event):
@@ -376,7 +385,7 @@ def lambda_handler(event, context):
     #    entiende RIO-DSL-SendDownlink.
     iot_data = boto3.client("iot-data")
     topic = DOWNLINK_TOPIC_TEMPLATE.format(motor_id=motor_id)
-    payload = json.dumps({"PRESION": round(float(valor_final), 1)})
+    payload = json.dumps({PARAMETRO_PRESION_REMOTA: round(float(valor_final), 1)})
     iot_data.publish(topic=topic, qos=1, payload=payload)
 
     # 7. Guardar el estado de debounce para la próxima vez.
