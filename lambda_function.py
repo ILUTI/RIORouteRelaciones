@@ -313,11 +313,13 @@ def lambda_handler(event, context):
 
     if isinstance(event, dict) and isinstance(event.get("Records"), list):
         from ruteo_relaciones import rutear_registro_stream
+        from botocore.config import Config
         ddb = boto3.client("dynamodb")
-        iot = boto3.client("iot-data")
+        # Mismo criterio que GIOMaps: invocacion sincrona del encoder del destino
+        lam = boto3.client("lambda", config=Config(read_timeout=25, retries={"max_attempts": 1}))
         resultados = []
         for registro in event["Records"]:
-            resultado = rutear_registro_stream(registro, ddb, iot)
+            resultado = rutear_registro_stream(registro, ddb, lam)
             print(f"[ruteo] {json.dumps(resultado, default=str)}")
             resultados.append(resultado)
         return {"registros": len(resultados), "resultados": resultados}

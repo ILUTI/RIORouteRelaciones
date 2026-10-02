@@ -13,9 +13,11 @@
 #      origen de ese destino (ej. todos los aspersores de ese motor).
 #   3. Estado en vivo: ultima lectura de cada origen (BatchGetItem).
 #   4. Descarta lecturas viejas o con falla de sensor, agrega segun la
-#      politica, aplica debounce contra lo ultimo publicado a ese destino y
-#      publica {parametro_destino: valor} en RIO/{CodigoDestino}/downlink —
-#      mismo topico que ya entiende la SendDownlink del destino.
+#      politica y aplica debounce contra lo ultimo enviado a ese destino.
+#   5. Invoca la Lambda encoder del tipo del destino (EncoderLambda del
+#      TIPO#{Id}/META del espejo, ej. RIO-DSL-SendDownlink) igual que GIOMaps:
+#      RequestResponse con {EncoderCampoCodigo o "codigo": WirelessDeviceId,
+#      parametro_destino: valor}. Sin pasar por MQTT ni por una IoT Rule.
 #
 # Parametros de la relacion (ParametrosSchema del tipo de relacion en GIOMaps);
 # los que falten toman DEFAULTS:
@@ -29,6 +31,7 @@
 # Variables de entorno: GIOMAPS_TABLA_MAESTROS (espejo), GIOMAPS_TABLA_ESTADO
 # (estado en vivo), RELACION_CLAVE (tipo de relacion, default PRESION_REMOTA),
 # MOTOR_STATE_TABLE_NAME (debounce, la misma tabla del camino anterior).
+# Permiso: lambda:InvokeFunction sobre las Lambdas encoder de los destinos.
 # ============================================================================
 
 import json
@@ -38,7 +41,10 @@ from decimal import Decimal
 
 RELACION_CLAVE = os.environ.get("RELACION_CLAVE", "PRESION_REMOTA")
 STATE_TABLE = os.environ.get("MOTOR_STATE_TABLE_NAME", "RIO-MotorDownlinkState")
-DOWNLINK_TOPIC_TEMPLATE = "RIO/{codigo}/downlink"
+CAMPO_CODIGO_DEFAULT = "codigo"
+CACHE_TIPOS_S = 300
+
+_tipos = {}  # IdTipoDispositivo -> (expira_epoch, TIPO#/META del espejo)
 
 DEFAULTS = {
     "variable_origen": "presion",
@@ -91,6 +97,31 @@ def _estados(ddb, tabla, wids):
     return estados
 
 
+def _tipo_destino(ddb, tabla, id_tipo, ahora):
+    """TIPO#{id}/META del espejo (EncoderLambda, EncoderCampoCodigo), cacheado por contenedor."""
+    en_cache = _tipos.get(id_tipo)
+    if en_cache and en_cache[0] > ahora:
+        return en_cache[1]
+    tipo = _deserializar(ddb.get_item(TableName=tabla, Key={"PK": {"S": f"TIPO#{id_tipo}"}, "SK": {"S": "META"}}).get("Item"))
+    _tipos[id_tipo] = (ahora + CACHE_TIPOS_S, tipo)
+    return tipo
+
+
+def _invocar_encoder(lam, tipo, destino, parametro, valor):
+    """Invoca la Lambda encoder del destino como GIOMaps (downlink_controller).
+    Devuelve (enviado, detalle)."""
+    campo = tipo.get("EncoderCampoCodigo") or CAMPO_CODIGO_DEFAULT
+    evento = {campo: destino["AwsWirelessDeviceId"], parametro: valor}
+    res = lam.invoke(FunctionName=tipo["EncoderLambda"], InvocationType="RequestResponse",
+                     Payload=json.dumps(evento).encode("utf-8"))
+    payload = json.loads(res["Payload"].read() or b"null")
+    if res.get("FunctionError"):
+        error = payload.get("errorMessage", payload) if isinstance(payload, dict) else payload
+        return False, f"error del encoder: {error}"
+    payload = payload if isinstance(payload, dict) else {}
+    return True, {"messageId": payload.get("messageId"), "transactionId": payload.get("transactionId")}
+
+
 def _agregar(valores, politica, valor_actual):
     if politica == "AVG":
         return sum(valores) / len(valores)
@@ -99,8 +130,9 @@ def _agregar(valores, politica, valor_actual):
     return min(valores)
 
 
-def rutear_registro_stream(registro, ddb, iot, ahora=None):
-    """Procesa un registro del DynamoDB Stream. Devuelve un dict con el resultado."""
+def rutear_registro_stream(registro, ddb, lam, ahora=None):
+    """Procesa un registro del DynamoDB Stream (ddb: cliente dynamodb, lam:
+    cliente lambda). Devuelve un dict con el resultado."""
     ahora = ahora or time.time()
     imagen = (registro.get("dynamodb") or {}).get("NewImage")
     if not imagen:
@@ -138,7 +170,7 @@ def rutear_registro_stream(registro, ddb, iot, ahora=None):
         resultado = {"origen": meta.get("Codigo"), "destino": destino.get("Codigo"),
                      "origenesConsiderados": len(lecturas), "origenesRelacionados": len(wids)}
         if not lecturas:
-            resultados.append({**resultado, "publicado": False, "razon": "sin lecturas frescas"})
+            resultados.append({**resultado, "enviado": False, "razon": "sin lecturas frescas"})
             continue
         valor = round(float(_agregar(lecturas, params["politica"], estado.get(var))), 1)
 
@@ -148,14 +180,23 @@ def rutear_registro_stream(registro, ddb, iot, ahora=None):
         ultimo_valor, ultimo_epoch = previo.get("lastPublishedPresion"), previo.get("lastPublishedUnix", 0)
         if ultimo_valor is not None and abs(valor - float(ultimo_valor)) < float(params["delta"]) \
                 and ahora - int(ultimo_epoch) < int(params["intervalo_min_s"]):
-            resultados.append({**resultado, "valor": valor, "publicado": False, "razon": "debounce"})
+            resultados.append({**resultado, "valor": valor, "enviado": False, "razon": "debounce"})
             continue
 
-        topico = DOWNLINK_TOPIC_TEMPLATE.format(codigo=destino["Codigo"])
-        iot.publish(topic=topico, qos=1, payload=json.dumps({params["parametro_destino"]: valor}))
+        tipo = _tipo_destino(ddb, tabla_maestros, destino.get("IdTipoDispositivo"), ahora)
+        if not tipo.get("EncoderLambda") or not destino.get("AwsWirelessDeviceId"):
+            resultados.append({**resultado, "valor": valor, "enviado": False,
+                               "razon": "destino sin EncoderLambda en su tipo o sin WirelessDeviceId"})
+            continue
+        enviado, detalle = _invocar_encoder(lam, tipo, destino, params["parametro_destino"], valor)
+        if not enviado:
+            # Sin actualizar el debounce: se reintenta con la proxima lectura
+            resultados.append({**resultado, "valor": valor, "enviado": False, "razon": detalle,
+                               "encoder": tipo["EncoderLambda"]})
+            continue
         ddb.update_item(TableName=STATE_TABLE, Key={"motorId": {"S": destino["Codigo"]}},
                         UpdateExpression="SET lastPublishedPresion = :p, lastPublishedUnix = :t",
                         ExpressionAttributeValues={":p": {"N": str(valor)}, ":t": {"N": str(int(ahora))}})
-        resultados.append({**resultado, "valor": valor, "publicado": True, "topico": topico,
-                           "parametro": params["parametro_destino"]})
+        resultados.append({**resultado, "valor": valor, "enviado": True, "encoder": tipo["EncoderLambda"],
+                           "parametro": params["parametro_destino"], **detalle})
     return {"nodo": meta.get("Codigo"), "relaciones": resultados}
